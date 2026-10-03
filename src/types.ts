@@ -23,11 +23,51 @@ export interface Speaker {
   color: string;
 }
 
-export interface Tag {
+export type EntryType = "topic" | "event" | "person";
+export type EntryStatus = "active" | "merged" | "deactivated";
+
+/** 词条：由编目组维护、随清单导入；校对员只在本机把片段挂到词条上 */
+export interface Entry {
   id: string;
-  label: string;
-  type: "topic" | "event" | "person";
+  /** 词条编号，编目组对账主键；旧数据刚抽出时为空 */
+  code: string;
+  name: string;
+  type: EntryType;
   color: string;
+  status: EntryStatus;
+  /** 合并或停用后的接续词条编号 */
+  mergedInto?: string;
+  /** 旧草稿内嵌、尚未按名称回填编号 */
+  pendingMigration?: boolean;
+}
+
+/** 编目组导出的词条清单项 */
+export interface CatalogEntry {
+  code: string;
+  name: string;
+  type?: EntryType;
+  status: EntryStatus;
+  mergedInto?: string;
+}
+
+export type ImportItemAction = "upsert" | "backfill" | "redirect" | "deactivate";
+
+export interface ImportItemResult {
+  code: string;
+  name: string;
+  action: ImportItemAction;
+  ok: boolean;
+  error?: string;
+}
+
+/** 一批导入的对账记录；entries 为清单快照，失败条目据此重试 */
+export interface ImportBatch {
+  id: string;
+  sourceName: string;
+  importedAt: string;
+  status: "done" | "partial" | "failed";
+  entries: CatalogEntry[];
+  items: ImportItemResult[];
 }
 
 export interface Segment {
@@ -43,7 +83,11 @@ export interface Segment {
     dialect: boolean;
     properNoun: boolean;
   };
-  tagIds: string[];
+  entryIds: string[];
+  /** 关联了已停用且无接续的词条，等待校对员重新归类 */
+  pendingReclassify: boolean;
+  /** 导致待重新归类的词条编号（词条恢复后逐条清除） */
+  pendingEntryCodes: string[];
   comments: ReviewComment[];
 }
 
@@ -62,13 +106,14 @@ export interface ProjectData {
   recordingDate: string;
   activeTrackId: string;
   speakers: Speaker[];
-  tags: Tag[];
+  entries: Entry[];
   tracks: TranscriptTrack[];
+  importBatches: ImportBatch[];
   updatedAt: string;
 }
 
 export interface PersistedEnvelope {
-  schema: 1;
+  schema: 1 | 2;
   revision: number;
   tabId: string;
   savedAt: number;

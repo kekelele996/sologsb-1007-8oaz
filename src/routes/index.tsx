@@ -12,7 +12,8 @@ import {
   onMount,
   untrack,
 } from "solid-js";
-import { createSeedProject, uid } from "../data";
+import { uid } from "../data";
+import { entryCounts, failedItemCount, parseCatalogFile, retryBatch, runImport } from "../catalog";
 import { downloadText, formatTime, loadProject, parseTime, saveProject } from "../persistence";
 import type { Confidence, PersistedEnvelope, ProjectData, Segment, TranscriptTrack } from "../types";
 
@@ -48,7 +49,9 @@ function parseTimedTranscript(input: string, trackName: string): TranscriptTrack
         confidence: 3,
         reviewed: false,
         flags: { lowConfidence: false, dialect: false, properNoun: false },
-        tagIds: [],
+        entryIds: [],
+        pendingReclassify: false,
+        pendingEntryCodes: [],
         comments: [],
       });
       continue;
@@ -68,7 +71,9 @@ function parseTimedTranscript(input: string, trackName: string): TranscriptTrack
         confidence: 3,
         reviewed: false,
         flags: { lowConfidence: false, dialect: false, properNoun: false },
-        tagIds: [],
+        entryIds: [],
+        pendingReclassify: false,
+        pendingEntryCodes: [],
         comments: [],
       });
     }
@@ -85,7 +90,9 @@ function parseTimedTranscript(input: string, trackName: string): TranscriptTrack
         confidence: 3,
         reviewed: false,
         flags: { lowConfidence: false, dialect: false, properNoun: false },
-        tagIds: [],
+        entryIds: [],
+        pendingReclassify: false,
+        pendingEntryCodes: [],
         comments: [],
       });
     });
@@ -112,11 +119,13 @@ export default function OralHistoryEditor() {
   const [conflict, setConflict] = createSignal<PersistedEnvelope | null>(null);
   const [online, setOnline] = createSignal(true);
   const [helpOpen, setHelpOpen] = createSignal(false);
+  const [batchOpen, setBatchOpen] = createSignal(false);
   const [commentDraft, setCommentDraft] = createSignal("");
   const [replyDrafts, setReplyDrafts] = createSignal<Record<string, string>>({});
   const [trackFilter, setTrackFilter] = createSignal<"all" | "unreviewed" | "low">("all");
   let editorRef: HTMLTextAreaElement | undefined;
   let fileInputRef: HTMLInputElement | undefined;
+  let catalogInputRef: HTMLInputElement | undefined;
   let saveTimer: number | undefined;
   let hydrated = false;
   let dirty = false;
@@ -140,7 +149,11 @@ export default function OralHistoryEditor() {
   });
   const speakerById = (speakerId: string) =>
     project().speakers.find((speaker) => speaker.id === speakerId) ?? project().speakers[0];
-  const tagById = (tagId: string) => project().tags.find((tag) => tag.id === tagId);
+  const entryById = (entryId: string) => project().entries.find((entry) => entry.id === entryId);
+  const counts = createMemo(() => entryCounts(project()));
+  const pendingMigrationCount = createMemo(() => counts().pending);
+  const latestBatch = createMemo(() => project().importBatches[0] ?? null);
+  const latestFailedCount = createMemo(() => failedItemCount(latestBatch()));
 
   const commit = (label: string, mutate: (draft: ProjectData) => void) => {
     const current = structuredClone(project());
@@ -249,7 +262,9 @@ export default function OralHistoryEditor() {
     commitSegment("合并下一片段", (current, draft) => {
       current.text = `${current.text.trim()} ${next.text.trim()}`;
       current.end = next.end;
-      current.tagIds = [...new Set([...current.tagIds, ...next.tagIds])];
+      current.entryIds = [...new Set([...current.entryIds, ...next.entryIds])];
+      current.pendingEntryCodes = [...new Set([...current.pendingEntryCodes, ...next.pendingEntryCodes])];
+      current.pendingReclassify = current.pendingEntryCodes.length > 0;
       current.comments.push(...next.comments);
       current.confidence = Math.min(current.confidence, next.confidence) as Confidence;
       const sourceTrack = draft.tracks.find((item) => item.id === draft.activeTrackId);
@@ -312,11 +327,11 @@ export default function OralHistoryEditor() {
     });
   };
 
-  const toggleTag = (tagId: string) => {
-    commitSegment("更新主题关联", (segment) => {
-      segment.tagIds = segment.tagIds.includes(tagId)
-        ? segment.tagIds.filter((id) => id !== tagId)
-        : [...segment.tagIds, tagId];
+  const toggleEntry = (entryId: string) => {
+    commitSegment("更新词条关联", (segment) => {
+      segment.entryIds = segment.entryIds.includes(entryId)
+        ? segment.entryIds.filter((id) => id !== entryId)
+        : [...segment.entryIds, entryId];
       segment.reviewed = false;
     });
   };
@@ -340,6 +355,40 @@ export default function OralHistoryEditor() {
       draft.tracks.push(imported);
       draft.activeTrackId = imported.id;
       setSelectedId(imported.segments[0].id);
+    });
+  };
+
+  const importCatalogFile = async (file: File) => {
+    const text = await file.text();
+    let incoming: ReturnType<typeof parseCatalogFile>;
+    try {
+      incoming = parseCatalogFile(text);
+    } catch (err) {
+      setLastAction(err instanceof Error ? err.message : "词条清单解析失败");
+      return;
+    }
+    if (!incoming.length) {
+      setLastAction("词条清单为空");
+      return;
+    }
+    commit("导入词条清单", (draft) => {
+      const batch = runImport(draft, incoming, file.name.replace(/\.[^.]+$/, ""));
+      const failed = batch.items.filter((item) => !item.ok).length;
+      setLastAction(
+        failed
+          ? `词条清单已对账：${batch.items.length - failed} 条对上，${failed} 条失败（已保留对上的条目）`
+          : `词条清单已对账：${batch.items.length} 条全部对上`,
+      );
+      setBatchOpen(true);
+    });
+  };
+
+  const retryFailed = (batchId: string) => {
+    commit("重试失败词条", (draft) => {
+      const batch = retryBatch(draft, batchId);
+      if (!batch) return;
+      const failed = batch.items.filter((item) => !item.ok).length;
+      setLastAction(failed ? `重试完成：仍有 ${failed} 条对不上` : "失败词条已全部补上编号");
     });
   };
 
@@ -535,17 +584,56 @@ export default function OralHistoryEditor() {
           </section>
 
           <section class="panel-section tag-summary">
-            <div class="section-title"><h2>标注实体</h2><span>{project().tags.length}</span></div>
-            <div class="legend">
-              <span><i style={{ background: "#2563eb" }} />主题</span>
-              <span><i style={{ background: "#b45309" }} />事件</span>
-              <span><i style={{ background: "#be185d" }} />人物</span>
+            <div class="section-title"><h2>词条库</h2><span>{project().entries.length}</span></div>
+            <div class="entry-counts">
+              <span>活跃 <b>{counts().active}</b></span>
+              <span>合并 <b>{counts().merged}</b></span>
+              <span>停用 <b>{counts().deactivated}</b></span>
+              <Show when={counts().pending}>
+                <span class="pending">待编号 <b>{counts().pending}</b></span>
+              </Show>
             </div>
-            <p>在右侧“标注”页把当前片段关联到主题、事件和人物。</p>
+            <p>词条由编目组维护；导入新清单后按编号对账，合并会自动改接关联，停用无后继的片段标为待重新归类。</p>
+            <input
+              ref={catalogInputRef}
+              type="file"
+              accept=".json,application/json"
+              hidden
+              onChange={(event) => {
+                const file = event.currentTarget.files?.[0];
+                if (file) void importCatalogFile(file);
+                event.currentTarget.value = "";
+              }}
+            />
+            <button class="wide-action" onClick={() => catalogInputRef?.click()}><span>↥</span> 导入编目组词条清单</button>
+            <button class="wide-action quiet" onClick={() => setBatchOpen(true)}>对账记录 {latestFailedCount() ? `· ${latestFailedCount()} 条待重试` : ""}</button>
           </section>
         </aside>
 
         <main class="transcript-panel">
+          <Show when={pendingMigrationCount()}>
+            <div class="catalog-banner migration" role="status">
+              <div>
+                <strong>{pendingMigrationCount()} 个内嵌词条还没有编目组编号</strong>
+                <span>已从旧草稿抽出建库，导入最新词条清单后将按名称自动回填编号；回填不上的会保留并标出。</span>
+              </div>
+              <div class="conflict-actions">
+                <button class="btn btn-quiet" onClick={() => catalogInputRef?.click()}>导入词条清单</button>
+              </div>
+            </div>
+          </Show>
+          <Show when={!pendingMigrationCount() && latestFailedCount()}>
+            <div class="catalog-banner retry" role="status">
+              <div>
+                <strong>上次导入有 {latestFailedCount()} 条词条对不上</strong>
+                <span>已对上的条目都保留着，只需补导清单后重试失败的条目。</span>
+              </div>
+              <div class="conflict-actions">
+                <button class="btn btn-quiet" onClick={() => latestBatch() && retryFailed(latestBatch()!.id)}>重试失败条目</button>
+                <button class="btn btn-quiet" onClick={() => setBatchOpen(true)}>查看记录</button>
+              </div>
+            </div>
+          </Show>
           <div class="panel-toolbar">
             <div>
               <div class="eyebrow">当前轨道</div>
@@ -580,12 +668,13 @@ export default function OralHistoryEditor() {
                       <Show when={segment.flags.lowConfidence}><span class="pill alert">低置信</span></Show>
                       <Show when={segment.flags.dialect}><span class="pill dialect">方言</span></Show>
                       <Show when={segment.flags.properNoun}><span class="pill proper">专名</span></Show>
+                      <Show when={segment.pendingReclassify}><span class="pill reclassify">待重新归类</span></Show>
                       <Show when={segment.reviewed}><span class="pill done">✓ 已校对</span></Show>
                     </div>
                     <p>{segment.text}</p>
                     <div class="segment-tags">
-                      <For each={segment.tagIds.map(tagById).filter(Boolean)}>
-                        {(tag) => <span style={{ "--tag-color": tag!.color } as any}>#{tag!.label}</span>}
+                      <For each={segment.entryIds.map(entryById).filter(Boolean)}>
+                        {(entry) => <span style={{ "--tag-color": entry!.color } as any}>#{entry!.name}</span>}
                       </For>
                     </div>
                   </div>
@@ -674,15 +763,31 @@ export default function OralHistoryEditor() {
                 </Tabs.Content>
 
                 <Tabs.Content value="annotate" class="tab-content">
-                  <div class="content-title"><h3>关联主题、事件与人物</h3><p>一个片段可关联多个实体，复核后颜色会显示在列表中。</p></div>
-                  <For each={project().tags}>
-                    {(tag) => (
-                      <button class={`tag-option ${segment().tagIds.includes(tag.id) ? "selected" : ""}`} onClick={() => toggleTag(tag.id)}>
-                        <i style={{ background: tag.color }} />
-                        <span><strong>#{tag.label}</strong><small>{tag.type === "topic" ? "主题" : tag.type === "event" ? "事件" : "人物"}</small></span>
-                        <b>{segment().tagIds.includes(tag.id) ? "✓" : "＋"}</b>
-                      </button>
-                    )}
+                  <div class="content-title"><h3>关联词条</h3><p>词条由编目组维护；一个片段可关联多个词条，合并/停用由清单导入后自动改接。</p></div>
+                  <For each={project().entries}>
+                    {(entry) => {
+                      const attached = segment().entryIds.includes(entry.id);
+                      const retired = entry.status !== "active";
+                      return (
+                        <button
+                          class={`tag-option ${attached ? "selected" : ""} ${retired ? "retired" : ""}`}
+                          disabled={retired}
+                          title={retired ? `该词条已${entry.status === "merged" ? "合并" : "停用"}${entry.mergedInto ? `，接续于 ${entry.mergedInto}` : ""}` : entry.code}
+                          onClick={() => toggleEntry(entry.id)}
+                        >
+                          <i style={{ background: entry.color }} />
+                          <span>
+                            <strong>#{entry.name} <em class="entry-code">{entry.code || "待编号"}</em></strong>
+                            <small>
+                              {entry.type === "topic" ? "主题" : entry.type === "event" ? "事件" : "人物"}
+                              {entry.status === "merged" ? " · 已合并" : entry.status === "deactivated" ? " · 已停用" : ""}
+                              {entry.pendingMigration ? " · 待回填编号" : ""}
+                            </small>
+                          </span>
+                          <b>{attached ? "✓" : "＋"}</b>
+                        </button>
+                      );
+                    }}
                   </For>
                 </Tabs.Content>
 
@@ -743,6 +848,60 @@ export default function OralHistoryEditor() {
               <span><kbd>?</kbd> 显示本帮助</span>
             </div>
             <div class="dialog-footer"><button class="btn btn-primary" onClick={() => setHelpOpen(false)}>开始校对</button></div>
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog>
+
+      <Dialog open={batchOpen()} onOpenChange={setBatchOpen}>
+        <Dialog.Portal>
+          <Dialog.Overlay class="dialog-overlay" />
+          <Dialog.Content class="dialog-content batch-dialog-content">
+            <Dialog.Title>词条导入与对账</Dialog.Title>
+            <Dialog.Description>
+              编目组每轮导出词条清单后在此导入。按词条编号对账：被合并的关联改接到合并目标，停用又无接续的片段标为待重新归类；批注和校对标记不会被清单覆盖。
+            </Dialog.Description>
+            <div class="dialog-footer batch-import-row">
+              <button class="btn btn-primary" onClick={() => catalogInputRef?.click()}>导入词条清单（JSON）</button>
+            </div>
+            <div class="batch-list">
+              <For each={project().importBatches} fallback={<div class="mini-empty">还没有导入过词条清单。</div>}>
+                {(batch) => (
+                  <article class={`batch-card ${batch.status}`}>
+                    <header>
+                      <strong>{batch.sourceName}</strong>
+                      <span>{new Date(batch.importedAt).toLocaleString()}</span>
+                    </header>
+                    <div class="batch-summary">
+                      <Show when={batch.status === "done"}><span class="batch-ok">全部 {batch.items.length} 条对上</span></Show>
+                      <Show when={batch.status === "partial"}>
+                        <span class="batch-ok">{batch.items.filter((item) => item.ok).length} 条对上</span>
+                        <span class="batch-fail">{failedItemCount(batch)} 条失败（已保留对上的条目）</span>
+                      </Show>
+                      <Show when={batch.status === "failed"}><span class="batch-fail">整批未对上，已回滚</span></Show>
+                      <Show when={failedItemCount(batch)}>
+                        <button class="btn btn-quiet" onClick={() => retryFailed(batch.id)}>只重试失败条目</button>
+                      </Show>
+                    </div>
+                    <ul class="batch-items">
+                      <For each={batch.items}>
+                        {(item) => (
+                          <li class={item.ok ? "ok" : "fail"}>
+                            <span class="batch-item-code">{item.code}</span>
+                            <span class="batch-item-name">{item.name}</span>
+                            <Show when={item.ok} fallback={<em class="batch-item-error">{item.error}</em>}>
+                              <em class="batch-item-action">
+                                {item.action === "upsert" ? "已更新" : item.action === "backfill" ? "已回填编号" : item.action === "redirect" ? "关联已改接" : "已停用·待重新归类"}
+                              </em>
+                            </Show>
+                          </li>
+                        )}
+                      </For>
+                    </ul>
+                  </article>
+                )}
+              </For>
+            </div>
+            <div class="dialog-footer"><button class="btn btn-quiet" onClick={() => setBatchOpen(false)}>关闭</button></div>
           </Dialog.Content>
         </Dialog.Portal>
       </Dialog>
