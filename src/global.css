@@ -200,3 +200,54 @@ kbd { padding: 2px 5px; border: 1px solid rgba(0,0,0,.15); border-bottom-width: 
   .top-actions { gap: 5px; }
   .network-chip { display: none; }
 }
+
+/* ----------------------------- 词条库与清单导入 ---------------------------- */
+.migration-banner { min-height: 52px; padding: 10px 20px; display: flex; align-items: center; justify-content: space-between; gap: 18px; color: #114532; background: #dff5ea; border-bottom: 1px solid #a9ddc2; }
+.migration-banner strong { display: block; font-size: 14px; }
+.migration-banner span { display: block; margin-top: 2px; font-size: 12px; color: #2c6a50; }
+
+.catalog-card { background: linear-gradient(145deg, #f5f8fc, #f0f4f8); }
+.catalog-pill { background: #e2ecf8 !important; color: #2b578d !important; white-space: nowrap; }
+.catalog-stats { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
+.catalog-stats span { font-size: 10px; color: #5f6a72; background: #fff; border: 1px solid #dde2e6; border-radius: 6px; padding: 4px 7px; }
+.catalog-stats b { color: #2b3640; }
+.reclassify-note, .local-only-note { color: #8a5515 !important; background: #fdf2df; border: 1px solid #eed3a4; border-radius: 7px; padding: 6px 8px !important; font-size: 11px !important; }
+.local-only-note { color: #6a3fa0 !important; background: #f3edfc; border-color: #d8c7f0; }
+.wide-action { position: relative; display: flex; align-items: center; justify-content: center; }
+.wide-action.quiet { border-style: solid; border-color: #d3d9de; background: #fff; color: #68737c; font-weight: 600; font-size: 12px; padding: 8px; margin-top: 7px; }
+.pending-badge { position: absolute; right: 9px; top: 50%; transform: translateY(-50%); font-style: normal; background: #b42318; color: #fff; font-size: 10px; border-radius: 99px; min-width: 17px; height: 17px; display: grid; place-items: center; padding: 0 4px; }
+
+.pill.reclass { background: #fde7cc; color: #8a4d09; }
+.segment-card.needs-reclassify { border-color: #e2b06a; background: #fffaf2; }
+.segment-card.needs-reclassify.selected { border-color: #c9852b; box-shadow: 0 0 0 2px rgba(201,133,43,.15), 0 8px 22px rgba(42,65,88,.08); }
+
+.tab-dot { display: inline-grid; place-items: center; min-width: 15px; height: 15px; margin-left: 4px; padding: 0 4px; border-radius: 99px; background: #d97706; color: #fff; font-size: 9px; font-style: normal; }
+
+.reclass-banner { border: 1px solid #e6c18b; background: #fdf3e3; border-radius: 9px; padding: 11px; margin-bottom: 14px; }
+.reclass-banner strong { font-size: 12px; color: #7d470a; }
+.reclass-banner p { font-size: 11px; line-height: 1.55; color: #6f5a3c; margin: 6px 0 9px; }
+.reclass-banner b { color: #8a4d09; }
+.reclass-banner .btn { width: 100%; font-size: 12px; }
+
+.content-title.subsection { margin-top: 18px; padding-top: 12px; border-top: 1px dashed #d9d8d0; }
+.tag-option.disabled { cursor: default; opacity: .72; background: #f6f6f3; grid-template-columns: 8px 1fr; }
+.tag-option.disabled.merged { border-left: 3px solid #7c98b8; }
+.tag-option.disabled.retired { border-left: 3px solid #c48074; }
+
+.catalog-dialog { width: min(660px, calc(100vw - 40px)); max-height: 86vh; overflow-y: auto; }
+.catalog-dialog [role="dialog-description"] { margin: 0 0 14px; color: #68737c; font-size: 12px; line-height: 1.55; }
+.catalog-input { width: 100%; border: 1px solid #ced3d7; border-radius: 8px; background: #fff; padding: 10px; font: 11px ui-monospace, "SF Mono", monospace; line-height: 1.5; resize: vertical; }
+.catalog-preview { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 9px; }
+.import-summary { margin-top: 12px; border-radius: 8px; padding: 9px 11px; font-size: 11px; line-height: 1.6; }
+.import-summary p { margin: 0; }
+.import-summary.ok { background: #e7f5ec; color: #1d6b43; border: 1px solid #b7dfc6; }
+.import-summary.warn { background: #fdf1e1; color: #84511a; border: 1px solid #eccfa0; }
+.catalog-actions { gap: 8px; }
+
+.pending-list { display: grid; gap: 8px; }
+.pending-row { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; border: 1px solid #ead6bd; background: #fffaf3; border-radius: 9px; padding: 10px 11px; }
+.pending-row strong { font-size: 12px; font-family: ui-monospace, monospace; }
+.pending-row small { display: block; color: #8a7a64; font-size: 10px; margin-top: 2px; }
+.pending-row p { margin: 5px 0 0; font-size: 11px; color: #9b4a17; line-height: 1.45; }
+.pending-row-actions { display: flex; flex-direction: column; gap: 5px; flex-shrink: 0; }
+.pending-row-actions .btn { padding: 5px 10px; font-size: 11px; white-space: nowrap; }

@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite dev",
     "build": "vite build && node scripts/emit-static.mjs",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:catalog": "rolldown scripts/test-catalog.ts --format esm --platform node --file node_modules/.cache/test-catalog.mjs && node node_modules/.cache/test-catalog.mjs"
   },
   "dependencies": {
     "@kobalte/core": "^0.13.14",

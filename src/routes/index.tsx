@@ -10,14 +10,47 @@ import {
   createSignal,
   onCleanup,
   onMount,
-  untrack,
 } from "solid-js";
-import { createSeedProject, uid } from "../data";
+import { uid } from "../data";
+import {
+  importBatch,
+  loadPendingRows,
+  mergePendingRows,
+  parseTermList,
+  reclassifySegment,
+  savePendingRows,
+} from "../catalog";
 import { downloadText, formatTime, loadProject, parseTime, saveProject } from "../persistence";
-import type { Confidence, PersistedEnvelope, ProjectData, Segment, TranscriptTrack } from "../types";
+import type {
+  Confidence,
+  PendingImportRow,
+  PersistedEnvelope,
+  ProjectData,
+  ReconcileResult,
+  Segment,
+  Term,
+  TermListRow,
+  TranscriptTrack,
+} from "../types";
 
 const CHANNEL_NAME = "sologsb-1007-editor";
 const TAB_ID = uid("tab");
+
+/** 编目组一轮清单的示例，可直接粘贴试用：合并、停用、改名、失败行各一。 */
+const SAMPLE_TERM_LIST = JSON.stringify(
+  {
+    catalogVersion: "2026-10-03-r4",
+    exportedAt: "2026-10-03T09:00:00+08:00",
+    rows: [
+      { code: "E-001", name: "抗日战争记忆", status: "active", version: 4 },
+      { code: "T-003", status: "merged", mergeTargetCode: "T-001", version: 4 },
+      { code: "P-002", status: "retired", version: 4 },
+      { code: "E-099", name: "1958 年外调", status: "merged", mergeTargetCode: "E-404", version: 4 },
+    ],
+  },
+  null,
+  2,
+);
 
 function statusText(status: "saved" | "saving" | "offline") {
   if (status === "saving") return "正在保存";
@@ -25,11 +58,28 @@ function statusText(status: "saved" | "saving" | "offline") {
   return "已自动保存";
 }
 
+const termTypeName = (type: Term["type"]) => (type === "topic" ? "主题" : type === "event" ? "事件" : "人物");
+
 function parseTimedTranscript(input: string, trackName: string): TranscriptTrack {
   const blocks = input.trim().split(/\n\s*\n/);
   const segments: Segment[] = [];
   const srtPattern = /(\d{1,2}:\d{2}:\d{2}[,.]\d{1,3})\s*-->\s*(\d{1,2}:\d{2}:\d{2}[,.]\d{1,3})/;
   const bracketPattern = /^\[?(\d{1,2}:\d{2}(?::\d{2})?)\]?\s*[-–]?\s*(.*)$/;
+
+  const emptySegment = (start: number, end: number, text: string, speakerId: string): Segment => ({
+    id: uid("seg"),
+    start,
+    end,
+    speakerId,
+    text,
+    confidence: 3,
+    reviewed: false,
+    flags: { lowConfidence: false, dialect: false, properNoun: false },
+    termCodes: [],
+    needsReclassify: false,
+    brokenTerms: [],
+    comments: [],
+  });
 
   for (const rawBlock of blocks) {
     const lines = rawBlock.split("\n").map((line) => line.trim()).filter(Boolean);
@@ -39,18 +89,14 @@ function parseTimedTranscript(input: string, trackName: string): TranscriptTrack
       const match = srtPattern.exec(lines[srtIndex]);
       const text = lines.slice(srtIndex + 1).join(" ");
       const speakerName = text.match(/^([^：:]{1,10})[：:]/)?.[1];
-      segments.push({
-        id: uid("seg"),
-        start: parseTime(match?.[1] ?? "0"),
-        end: parseTime(match?.[2] ?? "1"),
-        speakerId: speakerName ? "sp-custom" : "sp-interviewer",
-        text: text.replace(/^[^：:]{1,10}[：:]\s*/, ""),
-        confidence: 3,
-        reviewed: false,
-        flags: { lowConfidence: false, dialect: false, properNoun: false },
-        tagIds: [],
-        comments: [],
-      });
+      segments.push(
+        emptySegment(
+          parseTime(match?.[1] ?? "0"),
+          parseTime(match?.[2] ?? "1"),
+          text.replace(/^[^：:]{1,10}[：:]\s*/, ""),
+          speakerName ? "sp-custom" : "sp-interviewer",
+        ),
+      );
       continue;
     }
     for (const line of lines) {
@@ -59,35 +105,20 @@ function parseTimedTranscript(input: string, trackName: string): TranscriptTrack
       const start = parseTime(match[1]);
       const text = match[2];
       const speakerName = text.match(/^([^：:]{1,10})[：:]/)?.[1];
-      segments.push({
-        id: uid("seg"),
-        start,
-        end: start + Math.max(3, text.length / 5),
-        speakerId: speakerName ? "sp-custom" : "sp-interviewer",
-        text: text.replace(/^[^：:]{1,10}[：:]\s*/, ""),
-        confidence: 3,
-        reviewed: false,
-        flags: { lowConfidence: false, dialect: false, properNoun: false },
-        tagIds: [],
-        comments: [],
-      });
+      segments.push(
+        emptySegment(
+          start,
+          start + Math.max(3, text.length / 5),
+          text.replace(/^[^：:]{1,10}[：:]\s*/, ""),
+          speakerName ? "sp-custom" : "sp-interviewer",
+        ),
+      );
     }
   }
 
   if (!segments.length && input.trim()) {
     input.split("\n").map((line) => line.trim()).filter(Boolean).forEach((text, index) => {
-      segments.push({
-        id: uid("seg"),
-        start: index * 6,
-        end: index * 6 + 5.4,
-        speakerId: "sp-interviewer",
-        text,
-        confidence: 3,
-        reviewed: false,
-        flags: { lowConfidence: false, dialect: false, properNoun: false },
-        tagIds: [],
-        comments: [],
-      });
+      segments.push(emptySegment(index * 6, index * 6 + 5.4, text, "sp-interviewer"));
     });
   }
 
@@ -115,8 +146,18 @@ export default function OralHistoryEditor() {
   const [commentDraft, setCommentDraft] = createSignal("");
   const [replyDrafts, setReplyDrafts] = createSignal<Record<string, string>>({});
   const [trackFilter, setTrackFilter] = createSignal<"all" | "unreviewed" | "low">("all");
+  const [catalogOpen, setCatalogOpen] = createSignal(false);
+  const [catalogTab, setCatalogTab] = createSignal("import");
+  const [catalogText, setCatalogText] = createSignal("");
+  const [pendingRows, setPendingRows] = createSignal<PendingImportRow[]>(loadPendingRows());
+  const [migration, setMigration] = useStateMigration(loaded);
+  const [importSummary, setImportSummary] = createSignal<{
+    ok: boolean;
+    lines: string[];
+  } | null>(null);
   let editorRef: HTMLTextAreaElement | undefined;
   let fileInputRef: HTMLInputElement | undefined;
+  let termListInputRef: HTMLInputElement | undefined;
   let saveTimer: number | undefined;
   let hydrated = false;
   let dirty = false;
@@ -129,18 +170,31 @@ export default function OralHistoryEditor() {
   const activeSegment = createMemo(() => activeTrack()?.segments.find((item) => item.id === selectedId()) ?? null);
   const visibleSegments = createMemo(() => {
     const segments = activeTrack()?.segments ?? [];
-    if (trackFilter() === "unreviewed") return segments.filter((segment) => !segment.reviewed);
-    if (trackFilter() === "low") return segments.filter((segment) => segment.confidence <= 2 || segment.flags.lowConfidence);
+    if (trackFilter() === "unreviewed") return segments.filter((segment) => !segment.reviewed || segment.needsReclassify);
+    if (trackFilter() === "low") return segments.filter((segment) => segment.confidence <= 2 || segment.flags.lowConfidence || segment.needsReclassify);
     return segments;
   });
+  const reclassifyCount = createMemo(() =>
+    project().tracks.flatMap((track) => track.segments).filter((segment) => segment.needsReclassify).length,
+  );
   const completedPercent = createMemo(() => {
     const segments = project().tracks.flatMap((track) => track.segments);
     if (!segments.length) return 0;
-    return Math.round((segments.filter((segment) => segment.reviewed).length / segments.length) * 100);
+    return Math.round((segments.filter((segment) => segment.reviewed && !segment.needsReclassify).length / segments.length) * 100);
   });
   const speakerById = (speakerId: string) =>
     project().speakers.find((speaker) => speaker.id === speakerId) ?? project().speakers[0];
-  const tagById = (tagId: string) => project().tags.find((tag) => tag.id === tagId);
+  const termByCode = (code: string) => project().terms.find((term) => term.code === code);
+  const termStats = createMemo(() => {
+    const terms = project().terms;
+    return {
+      active: terms.filter((term) => term.status === "active" && !term.localOnly).length,
+      merged: terms.filter((term) => term.status === "merged").length,
+      retired: terms.filter((term) => term.status === "retired").length,
+      localOnly: terms.filter((term) => term.localOnly).length,
+    };
+  });
+  const parsedCatalog = createMemo(() => (catalogText().trim() ? parseTermList(catalogText()) : null));
 
   const commit = (label: string, mutate: (draft: ProjectData) => void) => {
     const current = structuredClone(project());
@@ -193,11 +247,9 @@ export default function OralHistoryEditor() {
   const switchTrack = (trackId: string) => {
     commit("切换文本轨", (draft) => {
       draft.activeTrackId = trackId;
-      selectedIdSet(draft.tracks.find((track) => track.id === trackId)?.segments[0]?.id ?? "");
+      setSelectedId(draft.tracks.find((track) => track.id === trackId)?.segments[0]?.id ?? "");
     });
   };
-
-  const selectedIdSet = (id: string) => setSelectedId(id);
 
   const moveSelection = (direction: 1 | -1) => {
     const segments = activeTrack()?.segments ?? [];
@@ -249,7 +301,7 @@ export default function OralHistoryEditor() {
     commitSegment("合并下一片段", (current, draft) => {
       current.text = `${current.text.trim()} ${next.text.trim()}`;
       current.end = next.end;
-      current.tagIds = [...new Set([...current.tagIds, ...next.tagIds])];
+      current.termCodes = [...new Set([...current.termCodes, ...next.termCodes])];
       current.comments.push(...next.comments);
       current.confidence = Math.min(current.confidence, next.confidence) as Confidence;
       const sourceTrack = draft.tracks.find((item) => item.id === draft.activeTrackId);
@@ -312,13 +364,17 @@ export default function OralHistoryEditor() {
     });
   };
 
-  const toggleTag = (tagId: string) => {
-    commitSegment("更新主题关联", (segment) => {
-      segment.tagIds = segment.tagIds.includes(tagId)
-        ? segment.tagIds.filter((id) => id !== tagId)
-        : [...segment.tagIds, tagId];
-      segment.reviewed = false;
+  /** 校对员只能把片段挂到本机词库中状态为 active 的词条上。 */
+  const toggleTerm = (termCode: string) => {
+    commitSegment("挂载/摘除词条", (segment) => {
+      if (!segment.termCodes.includes(termCode)) segment.termCodes = [...segment.termCodes, termCode];
+      else segment.termCodes = segment.termCodes.filter((code) => code !== termCode);
     });
+  };
+
+  const confirmReclassify = () => {
+    if (!activeSegment()?.termCodes.length) return;
+    commitSegment("完成重新归类", (segment, draft) => reclassifySegment(draft, segment.id, segment.termCodes));
   };
 
   const exportSrt = () => {
@@ -327,6 +383,10 @@ export default function OralHistoryEditor() {
       return `${index + 1}\n${formatTime(segment.start)} --> ${formatTime(segment.end)}\n${speaker}：${segment.text}\n`;
     });
     downloadText(`${project().title}-${activeTrack().name}.srt`, lines.join("\n"), "application/x-subrip;charset=utf-8");
+  };
+
+  const exportTermTemplate = () => {
+    downloadText(`词条清单-${new Date().toISOString().slice(0, 10)}.json`, SAMPLE_TERM_LIST, "application/json;charset=utf-8");
   };
 
   const importFile = async (file: File) => {
@@ -341,6 +401,98 @@ export default function OralHistoryEditor() {
       draft.activeTrackId = imported.id;
       setSelectedId(imported.segments[0].id);
     });
+  };
+
+  /**
+   * 执行一轮清单对账。清单行只改词条表与片段挂载，
+   * 批注、回复、校对标记一概不触碰；失败行进独立重试队列。
+   * baseQueue 是重试后队列的基座（重试成功的行先从基座剔除，不再留下）。
+   */
+  const runTermImport = (
+    rows: TermListRow[],
+    catalogVersion: string | undefined,
+    options: { silent: boolean; baseQueue?: PendingImportRow[] },
+  ) => {
+    const current = structuredClone(project());
+    let outcome: { result: ReconcileResult; failures: PendingImportRow[] };
+    try {
+      outcome = importBatch(current, rows, catalogVersion);
+    } catch (error) {
+      const message = `清单解析后对账异常：${(error as Error).message}`;
+      setImportSummary({ ok: false, lines: [message] });
+      setLastAction(message);
+      return;
+    }
+
+    const base = options.baseQueue;
+    const queue = base !== undefined
+      ? mergePendingRows(base, outcome.failures)
+      : mergePendingRows(pendingRows(), outcome.failures);
+    setPendingRows(queue);
+    savePendingRows(queue);
+
+    const r = outcome.result;
+    const lines: string[] = [];
+    if (r.applied) lines.push(`新增/更新 ${r.applied} 条`);
+    if (r.merged) lines.push(`合并改挂 ${r.merged} 条`);
+    if (r.retired) lines.push(`停用 ${r.retired} 条`);
+    if (r.backfilled) lines.push(`按名称回填编号 ${r.backfilled} 条`);
+    if (r.reclassified) lines.push(`${r.reclassified} 处片段关联标为待重新归类`);
+    if (outcome.failures.length) lines.push(`${outcome.failures.length} 行失败，已回滚该行并进入重试队列`);
+    if (!lines.length) lines.push("清单没有带来变化");
+    const changed = r.applied + r.merged + r.retired + r.backfilled + r.reclassified + outcome.failures.length > 0;
+    setImportSummary({ ok: outcome.failures.length === 0, lines });
+
+    current.updatedAt = new Date().toISOString();
+
+    if (options.silent) {
+      if (!changed) return;
+      setProject(current);
+      setRevision((value) => value + 1);
+      setLastAction(
+        outcome.failures.length
+          ? `打开时自动重试：${rows.length - outcome.failures.length}/${rows.length} 行对上，其余继续等待`
+          : `打开时自动重试成功，${rows.length} 条已对上`,
+      );
+    } else {
+      batch(() => {
+        setPast((items) => [...items.slice(-49), structuredClone(project())]);
+        setFuture([]);
+        setProject(current);
+        setRevision((value) => value + 1);
+        setLastAction("导入编目组词条清单");
+      });
+    }
+    dirty = true;
+  };
+
+  const submitCatalogText = () => {
+    const parsed = parsedCatalog();
+    if (!parsed || !parsed.rows.length) return;
+    runTermImport(parsed.rows, parsed.manifest?.catalogVersion, { silent: false });
+  };
+
+  const importTermListFile = async (file: File) => {
+    const text = await file.text();
+    setCatalogText(text);
+    setCatalogTab("import");
+    setImportSummary(null);
+    setCatalogOpen(true);
+  };
+
+  const retryRows = (onlyCode?: string) => {
+    const rows = pendingRows().filter((row) => !onlyCode || row.code === onlyCode);
+    if (!rows.length) return;
+    // 本次参与重试的行先移出基座；成功的不再回来，仍失败的重新入队。
+    const base = pendingRows().filter((row) => !rows.includes(row));
+    runTermImport(rows, rows[0]?.catalogVersion, { silent: false, baseQueue: base });
+  };
+
+  const discardPending = (code: string) => {
+    const next = pendingRows().filter((row) => row.code !== code);
+    setPendingRows(next);
+    savePendingRows(next);
+    setLastAction(`已移出走失行 ${code}`);
   };
 
   const resolveConflict = (useIncoming: boolean) => {
@@ -363,6 +515,13 @@ export default function OralHistoryEditor() {
 
   onMount(() => {
     hydrated = true;
+
+    // 下次打开只重试上轮失败的那几条；成功的自动出队。
+    const waiting = loadPendingRows();
+    if (waiting.length) {
+      runTermImport(waiting, waiting[0]?.catalogVersion, { silent: true, baseQueue: [] });
+    }
+
     const handleOnline = () => setOnline(true);
     const handleOffline = () => setOnline(false);
     const handleStorage = (event: StorageEvent) => {
@@ -454,6 +613,24 @@ export default function OralHistoryEditor() {
 
   return (
     <div class="app-shell">
+      <Show when={migration()}>
+        {(info) => (
+          <div class="migration-banner" role="status">
+            <div>
+              <strong>旧草稿已迁移到编目词条库</strong>
+              <span>
+                抽出内嵌词条 {info().extracted} 条，按名称回填编号 {info().backfilled} 条；
+                {info().unresolvedNames.length > 0
+                  ? `回填不上、已保留待编目确认：${info().unresolvedNames.join("、")}`
+                  : "全部按名称对上编目编号。"}
+                批注与校对标记原样保留。
+              </span>
+            </div>
+            <button class="btn btn-quiet" onClick={() => setMigration(null)}>知道了</button>
+          </div>
+        )}
+      </Show>
+
       <Show when={conflict()}>
         {(incoming) => (
           <div class="conflict-banner" role="alert">
@@ -500,9 +677,12 @@ export default function OralHistoryEditor() {
             <div class="eyebrow">校对进度</div>
             <div class="progress-row">
               <strong>{completedPercent()}%</strong>
-              <span>{project().tracks.flatMap((track) => track.segments).filter((segment) => segment.reviewed).length} / {project().tracks.flatMap((track) => track.segments).length} 片段</span>
+              <span>{project().tracks.flatMap((track) => track.segments).filter((segment) => segment.reviewed && !segment.needsReclassify).length} / {project().tracks.flatMap((track) => track.segments).length} 片段</span>
             </div>
             <div class="progress-track"><i style={{ width: `${completedPercent()}%` }} /></div>
+            <Show when={reclassifyCount() > 0}>
+              <p class="reclassify-note">⚠ {reclassifyCount()} 个片段因词条停用待重新归类。</p>
+            </Show>
             <p>修改会自动保存在本机；断网后仍可继续校对。</p>
           </section>
 
@@ -534,14 +714,36 @@ export default function OralHistoryEditor() {
             <div class="hint">支持 SRT / VTT / 每行 `[00:12] 文本`</div>
           </section>
 
-          <section class="panel-section tag-summary">
-            <div class="section-title"><h2>标注实体</h2><span>{project().tags.length}</span></div>
-            <div class="legend">
-              <span><i style={{ background: "#2563eb" }} />主题</span>
-              <span><i style={{ background: "#b45309" }} />事件</span>
-              <span><i style={{ background: "#be185d" }} />人物</span>
+          <section class="panel-section catalog-card">
+            <div class="section-title">
+              <h2>词条库</h2>
+              <span class="catalog-pill">编目组维护 · 本机只读</span>
             </div>
-            <p>在右侧“标注”页把当前片段关联到主题、事件和人物。</p>
+            <div class="catalog-stats">
+              <span><b>{termStats().active}</b> 在用</span>
+              <span><b>{termStats().merged}</b> 已合并</span>
+              <span><b>{termStats().retired}</b> 已停用</span>
+            </div>
+            <Show when={termStats().localOnly > 0}>
+              <p class="local-only-note">？ {termStats().localOnly} 条旧草稿词条回填不上编号，已标出待编目确认。</p>
+            </Show>
+            <input
+              ref={termListInputRef}
+              type="file"
+              accept=".json,application/json"
+              hidden
+              onChange={(event) => {
+                const file = event.currentTarget.files?.[0];
+                if (file) void importTermListFile(file);
+                event.currentTarget.value = "";
+              }}
+            />
+            <button class="wide-action" onClick={() => { setCatalogOpen(true); setCatalogTab(pendingRows().length ? "retry" : "import"); }}>
+              <span>⇄</span> 导入词条清单
+              <Show when={pendingRows().length}><em class="pending-badge">{pendingRows().length}</em></Show>
+            </button>
+            <button class="wide-action quiet" onClick={() => termListInputRef?.click()}>从文件读取清单</button>
+            <div class="hint">按编目组编号对账：合并自动改挂，停用无接续的片段标待重新归类。</div>
           </section>
         </aside>
 
@@ -565,7 +767,7 @@ export default function OralHistoryEditor() {
                   id={`segment-${segment.id}`}
                   role="option"
                   aria-selected={segment.id === selectedId()}
-                  class={`segment-card ${segment.id === selectedId() ? "selected" : ""} ${segment.reviewed ? "reviewed" : ""}`}
+                  class={`segment-card ${segment.id === selectedId() ? "selected" : ""} ${segment.reviewed && !segment.needsReclassify ? "reviewed" : ""} ${segment.needsReclassify ? "needs-reclassify" : ""}`}
                   onClick={() => clickSegment(segment.id)}
                 >
                   <div class="segment-rail" style={{ background: speakerById(segment.speakerId)?.color ?? "#64748b" }} />
@@ -580,12 +782,13 @@ export default function OralHistoryEditor() {
                       <Show when={segment.flags.lowConfidence}><span class="pill alert">低置信</span></Show>
                       <Show when={segment.flags.dialect}><span class="pill dialect">方言</span></Show>
                       <Show when={segment.flags.properNoun}><span class="pill proper">专名</span></Show>
-                      <Show when={segment.reviewed}><span class="pill done">✓ 已校对</span></Show>
+                      <Show when={segment.reviewed && !segment.needsReclassify}><span class="pill done">✓ 已校对</span></Show>
+                      <Show when={segment.needsReclassify}><span class="pill reclass">⚠ 待重新归类</span></Show>
                     </div>
                     <p>{segment.text}</p>
                     <div class="segment-tags">
-                      <For each={segment.tagIds.map(tagById).filter(Boolean)}>
-                        {(tag) => <span style={{ "--tag-color": tag!.color } as any}>#{tag!.label}</span>}
+                      <For each={segment.termCodes.map(termByCode).filter(Boolean)}>
+                        {(term) => <span style={{ "--tag-color": term!.color } as any}>#{term!.name}</span>}
                       </For>
                     </div>
                   </div>
@@ -605,7 +808,10 @@ export default function OralHistoryEditor() {
               <Tabs defaultValue="correct" class="inspector-tabs">
                 <Tabs.List class="tab-list">
                   <Tabs.Trigger value="correct">校对</Tabs.Trigger>
-                  <Tabs.Trigger value="annotate">标注</Tabs.Trigger>
+                  <Tabs.Trigger value="annotate">
+                    词条
+                    <Show when={segment().needsReclassify}><em class="tab-dot">!</em></Show>
+                  </Tabs.Trigger>
                   <Tabs.Trigger value="comments">批注 <span>{segment().comments.length}</span></Tabs.Trigger>
                 </Tabs.List>
 
@@ -674,20 +880,63 @@ export default function OralHistoryEditor() {
                 </Tabs.Content>
 
                 <Tabs.Content value="annotate" class="tab-content">
-                  <div class="content-title"><h3>关联主题、事件与人物</h3><p>一个片段可关联多个实体，复核后颜色会显示在列表中。</p></div>
-                  <For each={project().tags}>
-                    {(tag) => (
-                      <button class={`tag-option ${segment().tagIds.includes(tag.id) ? "selected" : ""}`} onClick={() => toggleTag(tag.id)}>
-                        <i style={{ background: tag.color }} />
-                        <span><strong>#{tag.label}</strong><small>{tag.type === "topic" ? "主题" : tag.type === "event" ? "事件" : "人物"}</small></span>
-                        <b>{segment().tagIds.includes(tag.id) ? "✓" : "＋"}</b>
+                  <Show when={segment().needsReclassify}>
+                    <div class="reclass-banner">
+                      <strong>该片段的词条关联已断开</strong>
+                      <p>
+                        编目组停用了
+                        <For each={segment().brokenTerms ?? []}>
+                          {(name, i) => <b> {name}{i() < (segment().brokenTerms?.length ?? 0) - 1 ? "、" : ""}</b>}
+                        </For>
+                        且没有接续目标。请在下方勾选改挂的在用词条，批注与校对标记不会丢失。
+                      </p>
+                      <button class="btn btn-primary" disabled={!segment().termCodes.length} onClick={confirmReclassify}>
+                        完成重新归类（{segment().termCodes.length} 个词条）
+                      </button>
+                    </div>
+                  </Show>
+
+                  <div class="content-title">
+                    <h3>挂载词条</h3>
+                    <p>词条库由编目组单独维护；这里只把当前片段挂到在用词条上，不能新建或改写词条。</p>
+                  </div>
+                  <For each={project().terms.filter((term) => term.status === "active")}>
+                    {(term) => (
+                      <button class={`tag-option ${segment().termCodes.includes(term.code) ? "selected" : ""}`} onClick={() => toggleTerm(term.code)}>
+                        <i style={{ background: term.color }} />
+                        <span><strong>#{term.name}</strong><small>{termTypeName(term.type)} · {term.code}{term.localOnly ? " · 待回填" : ` · v${term.version}`}</small></span>
+                        <b>{segment().termCodes.includes(term.code) ? "✓" : "＋"}</b>
                       </button>
                     )}
                   </For>
+
+                  <Show when={project().terms.some((term) => term.status !== "active")}>
+                    <div class="content-title subsection"><h3>已合并 / 停用</h3><p>这些编号不可再挂载；已挂的片段已在导入时自动改挂或标待归类。</p></div>
+                    <For each={project().terms.filter((term) => term.status !== "active")}>
+                      {(term) => (
+                        <div class={`tag-option disabled ${term.status}`}>
+                          <i style={{ background: term.color }} />
+                          <span>
+                            <strong>#{term.name}</strong>
+                            <small>
+                              {term.code} · {term.status === "merged" ? "已合并" : "已停用"}
+                              <Show when={term.status === "merged"}>
+                                {" → "}
+                                {(() => {
+                                  const target = termByCode(term.mergeTargetCode ?? "");
+                                  return target ? `${target.name}（${target.code}）` : term.mergeTargetCode;
+                                })()}
+                              </Show>
+                            </small>
+                          </span>
+                        </div>
+                      )}
+                    </For>
+                  </Show>
                 </Tabs.Content>
 
                 <Tabs.Content value="comments" class="tab-content comments-content">
-                  <div class="content-title"><h3>批注与回复</h3><p>批注不会改写原文，可保留校对依据并继续讨论。</p></div>
+                  <div class="content-title"><h3>批注与回复</h3><p>批注不会改写原文，可保留校对依据并继续讨论；导入词条清单不会清空批注。</p></div>
                   <div class="comment-compose">
                     <textarea rows="3" placeholder="记录读音、词义或专名依据…" value={commentDraft()} onInput={(event) => setCommentDraft(event.currentTarget.value)} />
                     <button class="btn btn-primary" onClick={addComment}>添加批注</button>
@@ -726,6 +975,106 @@ export default function OralHistoryEditor() {
         <span class="status-shortcuts">J/K 浏览　R 已校对　M 合并　? 帮助</span>
       </footer>
 
+      <Dialog open={catalogOpen()} onOpenChange={(open) => { setCatalogOpen(open); if (open) setImportSummary(null); }}>
+        <Dialog.Portal>
+          <Dialog.Overlay class="dialog-overlay" />
+          <Dialog.Content class="dialog-content catalog-dialog">
+            <Dialog.Title>导入编目组词条清单</Dialog.Title>
+            <Dialog.Description>
+              按词条编号对账。两边各自持有版本；合并的关联顺着目标改挂，停用又没接续的片段标待重新归类，批注和校对标记不会被空值冲掉。
+            </Dialog.Description>
+
+            <Tabs value={catalogTab()} onChange={setCatalogTab}>
+              <Tabs.List class="tab-list">
+                <Tabs.Trigger value="import">粘贴 / 读取清单</Tabs.Trigger>
+                <Tabs.Trigger value="retry">
+                  失败重试
+                  <Show when={pendingRows().length}><em class="tab-dot">{pendingRows().length}</em></Show>
+                </Tabs.Trigger>
+              </Tabs.List>
+
+              <Tabs.Content value="import" class="tab-content">
+                <textarea
+                  class="catalog-input"
+                  rows="10"
+                  placeholder='粘贴编目组导出的 JSON：{ "catalogVersion": "...", "rows": [{ "code": "T-001", ... }] }'
+                  value={catalogText()}
+                  onInput={(event) => { setCatalogText(event.currentTarget.value); setImportSummary(null); }}
+                />
+                <Show when={parsedCatalog()}>
+                  {(parsed) => (
+                    <div class="catalog-preview">
+                      <Show when={parsed().manifest?.catalogVersion}>
+                        <span class="pill proper">清单版本 {parsed().manifest!.catalogVersion}</span>
+                      </Show>
+                      <span class="pill done">{parsed().rows.length} 行可对账</span>
+                      <For each={parsed().errors.slice(0, 4)}>
+                        {(error) => <span class="pill alert">{error}</span>}
+                      </For>
+                      <Show when={parsed().errors.length > 4}><span class="pill alert">另有 {parsed().errors.length - 4} 行格式问题</span></Show>
+                    </div>
+                  )}
+                </Show>
+                <Show when={importSummary()}>
+                  {(summary) => (
+                    <div class={`import-summary ${summary().ok ? "ok" : "warn"}`}>
+                      <For each={summary().lines}>{(line) => <p>· {line}</p>}</For>
+                    </div>
+                  )}
+                </Show>
+                <div class="dialog-footer catalog-actions">
+                  <button class="btn btn-quiet" onClick={exportTermTemplate}>下载清单模板</button>
+                  <button class="btn btn-quiet" onClick={() => setCatalogText(SAMPLE_TERM_LIST)}>填入示例</button>
+                  <button
+                    class="btn btn-primary"
+                    disabled={!parsedCatalog() || parsedCatalog()!.rows.length === 0}
+                    onClick={submitCatalogText}
+                  >
+                    按编号对账导入
+                  </button>
+                </div>
+              </Tabs.Content>
+
+              <Tabs.Content value="retry" class="tab-content">
+                <div class="content-title">
+                  <h3>上次没对上的行（{pendingRows().length}）</h3>
+                  <p>一批中失败的行会整行回滚并留在这里；已对上的行不受影响。下次打开编辑器会自动重试，也可手动重试。</p>
+                </div>
+                <Show when={pendingRows().length} fallback={<div class="mini-empty">没有待重试的失败行。</div>}>
+                  <div class="pending-list">
+                    <For each={pendingRows()}>
+                      {(row) => (
+                        <div class="pending-row">
+                          <div>
+                            <strong>{row.code}</strong>
+                            <small>{row.status ?? "active"}{row.mergeTargetCode ? ` → ${row.mergeTargetCode}` : ""} · 已重试 {row.attempts} 次</small>
+                            <p>{row.lastError}</p>
+                          </div>
+                          <div class="pending-row-actions">
+                            <button class="btn btn-quiet" onClick={() => retryRows(row.code)}>重试</button>
+                            <button class="btn btn-quiet" onClick={() => discardPending(row.code)}>移出队列</button>
+                          </div>
+                        </div>
+                      )}
+                    </For>
+                  </div>
+                  <div class="dialog-footer">
+                    <button class="btn btn-primary" onClick={() => retryRows()}>全部重试</button>
+                  </div>
+                </Show>
+                <Show when={importSummary()}>
+                  {(summary) => (
+                    <div class={`import-summary ${summary().ok ? "ok" : "warn"}`}>
+                      <For each={summary().lines}>{(line) => <p>· {line}</p>}</For>
+                    </div>
+                  )}
+                </Show>
+              </Tabs.Content>
+            </Tabs>
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog>
+
       <Dialog open={helpOpen()} onOpenChange={setHelpOpen}>
         <Dialog.Portal>
           <Dialog.Overlay class="dialog-overlay" />
@@ -748,4 +1097,8 @@ export default function OralHistoryEditor() {
       </Dialog>
     </div>
   );
+}
+
+function useStateMigration(loaded: ReturnType<typeof loadProject>) {
+  return createSignal(loaded.migrated ? loaded.migrationInfo ?? null : null);
 }
